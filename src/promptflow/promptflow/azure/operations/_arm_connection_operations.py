@@ -1,7 +1,6 @@
 # ---------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # ---------------------------------------------------------
-from enum import Enum
 from typing import Any, Dict, Union
 
 import requests
@@ -15,6 +14,7 @@ from azure.ai.ml._scope_dependent_operations import (
 from azure.core.exceptions import ClientAuthenticationError
 
 from promptflow._sdk.entities._connection import CustomConnection, _Connection
+from promptflow._utils.retry_utils import http_retry_wrapper
 from promptflow.azure._restclient.flow_service_caller import FlowServiceCaller
 from promptflow.azure._utils.gerneral import get_arm_token
 from promptflow.exceptions import ErrorTarget, SystemErrorException, UserErrorException
@@ -30,11 +30,14 @@ LIST_CONNECTION_URL = (
 FLOW_META_PREFIX = "azureml.flow."
 
 
-class ConnectionCategory(str, Enum):
+class ConnectionCategory:
     AzureOpenAI = "AzureOpenAI"
     CognitiveSearch = "CognitiveSearch"
     CognitiveService = "CognitiveService"
     CustomKeys = "CustomKeys"
+    OpenAI = "OpenAI"
+    Serp = "Serp"
+    Serverless = "Serverless"
 
 
 def get_case_insensitive_key(d, key, default=None):
@@ -92,7 +95,7 @@ class ArmConnectionOperations(_ScopeDependentOperations):
         :type model: Type[msrest.serialization.Model]
         """
         headers = {"Authorization": f"Bearer {token}"}
-        response = requests.request(method, f"https://{host}{url}", headers=headers)
+        response = http_retry_wrapper(requests.request)(method, f"https://{host}{url}", headers=headers)
         message_format = (
             f"Open url {{url}} failed with status code: {response.status_code}, action: {action}, reason: {{reason}}"
         )
@@ -119,10 +122,14 @@ class ArmConnectionOperations(_ScopeDependentOperations):
     def validate_and_fallback_connection_type(cls, name, type_name, category, metadata):
         if type_name:
             return type_name
-        if category == ConnectionCategory.AzureOpenAI:
-            return "AzureOpenAI"
-        if category == ConnectionCategory.CognitiveSearch:
-            return "CognitiveSearch"
+        # Below category has corresponding connection type in PromptFlow, so we can fall back directly.
+        # Note: CustomKeys may store different connection types for now, e.g. openai, serp.
+        if category in [
+            ConnectionCategory.AzureOpenAI,
+            ConnectionCategory.CognitiveSearch,
+            ConnectionCategory.Serverless,
+        ]:
+            return category
         if category == ConnectionCategory.CognitiveService:
             kind = get_case_insensitive_key(metadata, "Kind")
             if kind == "Content Safety":
@@ -189,6 +196,11 @@ class ArmConnectionOperations(_ScopeDependentOperations):
                 "api_key": properties.credentials.key,
                 "api_base": properties.target,
                 "api_version": get_case_insensitive_key(properties.metadata, "ApiVersion"),
+            }
+        elif properties.category == ConnectionCategory.Serverless:
+            value = {
+                "api_key": properties.credentials.key,
+                "api_base": properties.target,
             }
         elif properties.category == ConnectionCategory.CognitiveService:
             value = {

@@ -18,6 +18,7 @@ from promptflow.azure.operations import RunOperations
 from promptflow.azure.operations._arm_connection_operations import ArmConnectionOperations
 from promptflow.azure.operations._connection_operations import ConnectionOperations
 from promptflow.azure.operations._flow_operations import FlowOperations
+from promptflow.azure.operations._trace_operations import TraceOperations
 from promptflow.exceptions import UserErrorException
 
 
@@ -49,7 +50,7 @@ class PFClient:
     ):
         self._validate_config_information(subscription_id, resource_group_name, workspace_name, kwargs)
         # add user agent from kwargs if any
-        if isinstance(kwargs.get("user_agent"), str):
+        if isinstance(kwargs.get("user_agent", None), str):
             ClientUserAgentUtil.append_user_agent(kwargs["user_agent"])
         # append SDK ua to context
         user_agent = setup_user_agent_to_operation_context(USER_AGENT)
@@ -103,6 +104,12 @@ class PFClient:
             operation_config=self._ml_client._operation_config,
             all_operations=self._ml_client._operation_container,
             credential=self._ml_client._credential,
+            service_caller=self._service_caller,
+            **kwargs,
+        )
+        self._traces = TraceOperations(
+            operation_scope=self._ml_client._operation_scope,
+            operation_config=self._ml_client._operation_config,
             service_caller=self._service_caller,
             **kwargs,
         )

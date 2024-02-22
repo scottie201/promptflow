@@ -17,6 +17,7 @@ from promptflow._cli._params import (
     add_param_output_format,
     add_param_run_name,
     add_param_set,
+    add_param_yes,
     add_parser_build,
     base_params,
 )
@@ -24,7 +25,6 @@ from promptflow._cli._utils import (
     _output_result_list_with_format,
     activate_action,
     confirm,
-    exception_handler,
     list_of_dict_to_dict,
     list_of_dict_to_nested_dict,
     pretty_print_dataframe_as_table,
@@ -33,6 +33,7 @@ from promptflow._sdk._constants import MAX_SHOW_DETAILS_RESULTS, get_list_view_t
 from promptflow._sdk._load_functions import load_run
 from promptflow._sdk._pf_client import PFClient
 from promptflow._sdk._run_functions import _create_run
+from promptflow._sdk._utils import safe_parse_object_list
 from promptflow._sdk.entities import Run
 from promptflow.exceptions import UserErrorException
 
@@ -352,7 +353,7 @@ Example:
 # Delete a run:
 pf run delete -n "<name>"
 """
-    add_params = [add_param_run_name] + base_params
+    add_params = [add_param_run_name, add_param_yes] + base_params
 
     activate_action(
         name="delete",
@@ -435,7 +436,7 @@ def dispatch_run_commands(args: argparse.Namespace):
     elif args.sub_action == "export":
         export_run(args)
     elif args.sub_action == "delete":
-        delete_run(name=args.name)
+        delete_run(args.name, args.yes)
     else:
         raise ValueError(f"Unrecognized command: {args.sub_action}")
 
@@ -462,7 +463,6 @@ def _parse_metadata_args(params: List[Dict[str, str]]) -> Tuple[Optional[str], O
     return display_name, description, tags
 
 
-@exception_handler("Update run")
 def update_run(name: str, params: List[Dict[str, str]]) -> None:
     # params_override can have multiple items when user specifies with
     # `--set key1=value1 key2=value`
@@ -478,14 +478,12 @@ def update_run(name: str, params: List[Dict[str, str]]) -> None:
     print(json.dumps(run._to_dict(), indent=4))
 
 
-@exception_handler("Stream run")
 def stream_run(name: str) -> None:
     pf_client = PFClient()
     run = pf_client.runs.stream(name=name)
     print(json.dumps(run._to_dict(), indent=4))
 
 
-@exception_handler("List runs")
 def list_runs(
     max_results: int,
     all_results: bool,
@@ -502,47 +500,46 @@ def list_runs(
         list_view_type=get_list_view_type(archived_only=archived_only, include_archived=include_archived),
     )
     # hide additional info and debug info in run list for better user experience
-    json_list = [run._to_dict(exclude_additional_info=True, exclude_debug_info=True) for run in runs]
+    parser = lambda run: run._to_dict(exclude_additional_info=True, exclude_debug_info=True)  # noqa: E731
+    json_list = safe_parse_object_list(
+        obj_list=runs,
+        parser=parser,
+        message_generator=lambda x: f"Error parsing run {x.name!r}, skipped.",
+    )
     _output_result_list_with_format(result_list=json_list, output_format=output)
     return runs
 
 
-@exception_handler("Show run")
 def show_run(name: str) -> None:
     pf_client = PFClient()
     run = pf_client.runs.get(name=name)
     print(json.dumps(run._to_dict(), indent=4))
 
 
-@exception_handler("Show run details")
 def show_run_details(name: str, max_results: int, all_results: bool) -> None:
     pf_client = PFClient()
     details = pf_client.runs.get_details(name=name, max_results=max_results, all_results=all_results)
     pretty_print_dataframe_as_table(details)
 
 
-@exception_handler("Show run metrics")
 def show_run_metrics(name: str) -> None:
     pf_client = PFClient()
     metrics = pf_client.runs.get_metrics(name=name)
     print(json.dumps(metrics, indent=4))
 
 
-@exception_handler("Visualize run")
 def visualize_run(names: str, html_path: Optional[str] = None) -> None:
     run_names = [name.strip() for name in names.split(",")]
     pf_client = PFClient()
     pf_client.runs.visualize(run_names, html_path=html_path)
 
 
-@exception_handler("Archive run")
 def archive_run(name: str) -> None:
     pf_client = PFClient()
     run = pf_client.runs.archive(name=name)
     print(json.dumps(run._to_dict(), indent=4))
 
 
-@exception_handler("Restore run")
 def restore_run(name: str) -> None:
     pf_client = PFClient()
     run = pf_client.runs.restore(name=name)
@@ -560,7 +557,6 @@ def _parse_kv_pair(kv_pairs: str) -> Dict[str, str]:
     return result
 
 
-@exception_handler("Create run")
 def create_run(create_func: Callable, args):
     file = args.file
     flow = args.flow
@@ -629,9 +625,8 @@ def create_run(create_func: Callable, args):
     print(json.dumps(run._to_dict(), indent=4))
 
 
-@exception_handler("Delete run")
-def delete_run(name: str) -> None:
-    if confirm("Are you sure to delete run irreversibly?"):
+def delete_run(name: str, skip_confirm: bool = False) -> None:
+    if confirm("Are you sure to delete run irreversibly?", skip_confirm):
         pf_client = PFClient()
         pf_client.runs.delete(name=name)
     else:

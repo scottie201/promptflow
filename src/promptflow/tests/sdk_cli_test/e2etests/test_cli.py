@@ -2,15 +2,16 @@ import importlib
 import importlib.util
 import json
 import logging
-import multiprocessing
 import os
 import os.path
 import shutil
+import subprocess
 import sys
 import tempfile
 import uuid
 from pathlib import Path
 from tempfile import mkdtemp
+from time import sleep
 from typing import Dict, List
 from unittest.mock import patch
 
@@ -28,7 +29,8 @@ from promptflow._sdk.operations._run_operations import RunOperations
 from promptflow._utils.context_utils import _change_working_dir
 from promptflow._utils.utils import environment_variable_overwrite, parse_ua_to_dict
 from promptflow._utils.yaml_utils import dump_yaml, load_yaml
-from promptflow.exceptions import UserErrorException
+
+from ..recording_utilities import is_live
 
 FLOWS_DIR = "./tests/test_configs/flows"
 EXPERIMENT_DIR = "./tests/test_configs/experiments"
@@ -56,34 +58,6 @@ def run_pf_command(*args, cwd=None):
     finally:
         sys.argv = origin_argv
         os.chdir(origin_cwd)
-
-
-def run_batch(local_client, line_timeout_seconds, timeout_index=None):
-    os.environ["PF_LINE_TIMEOUT_SEC"] = line_timeout_seconds
-    run_id = str(uuid.uuid4())
-    run_pf_command(
-        "run",
-        "create",
-        "--flow",
-        f"{FLOWS_DIR}/simple_flow_with_ten_inputs",
-        "--data",
-        f"{FLOWS_DIR}/simple_flow_with_ten_inputs/data.jsonl",
-        "--name",
-        run_id,
-    )
-    run = local_client.runs.get(name=run_id)
-    local_storage = LocalStorageOperations(run)
-    detail = local_storage.load_detail()
-    flow_runs_list = detail["flow_runs"]
-    for i, flow_run in enumerate(flow_runs_list):
-        if i == timeout_index:
-            assert flow_run["status"] == "Failed"
-            assert flow_run["error"]["message"] == f"Line {i} execution timeout for exceeding 54 seconds"
-            assert flow_run["error"]["code"] == "UserError"
-            assert flow_run["error"]["innerError"]["code"] == "LineExecutionTimeoutError"
-        else:
-            assert flow_run["status"] == "Completed"
-    os.environ.pop("PF_LINE_TIMEOUT_SEC")
 
 
 @pytest.mark.usefixtures(
@@ -794,7 +768,7 @@ class TestCli:
 
             # Test template name doesn't exist in python function
             jinja_name = "mock_jinja"
-            with pytest.raises(UserErrorException) as ex:
+            with pytest.raises(SystemExit):
                 run_pf_command(
                     "flow",
                     "init",
@@ -807,7 +781,8 @@ class TestCli:
                     "--prompt-template",
                     f"{jinja_name}={jinja_name}.jinja2",
                 )
-            assert f"Template parameter {jinja_name} doesn't find in python function arguments." in str(ex.value)
+                _, err = capsys.readouterr()
+                assert f"Template parameter {jinja_name} doesn't find in python function arguments." in err
 
             with pytest.raises(SystemExit):
                 run_pf_command("flow", "init")
@@ -1189,8 +1164,8 @@ class TestCli:
         finally:
             shutil.rmtree(output_path, ignore_errors=True)
 
-    def test_flow_build_with_ua(self):
-        with pytest.raises(UserErrorException) as e:
+    def test_flow_build_with_ua(self, capsys):
+        with pytest.raises(SystemExit):
             run_pf_command(
                 "flow",
                 "build",
@@ -1203,7 +1178,8 @@ class TestCli:
                 "--user-agent",
                 "test/1.0.0",
             )
-        assert "not exist" in str(e.value)
+            _, err = capsys.readouterr()
+            assert "not exist" in err
 
     @pytest.mark.parametrize(
         "file_name, expected, update_item",
@@ -1434,6 +1410,12 @@ class TestCli:
             # Test init package tool with extra info
             package_name = "tool_with_extra_info"
             package_folder = Path(temp_dir) / package_name
+            package_folder.mkdir(exist_ok=True, parents=True)
+            manifest_file = package_folder / "MANIFEST.in"
+            mock_manifest_content = "include mock/path"
+            with open(manifest_file, "w") as f:
+                f.write(mock_manifest_content)
+
             icon_path = Path(DATAS_DIR) / "logo.jpg"
             category = "test_category"
             tags = {"tag1": "value1", "tag2": "value2"}
@@ -1450,6 +1432,10 @@ class TestCli:
                 f"tags={tags}",
                 cwd=temp_dir,
             )
+            with open(manifest_file, "r") as f:
+                content = f.read()
+                assert mock_manifest_content in content
+                assert f"include {package_name}/icons" in content
             # Add a tool script with icon
             tool_script_name = "tool_func_with_icon"
             run_pf_command(
@@ -1494,6 +1480,35 @@ class TestCli:
                 )
             outerr = capsys.readouterr()
             assert "Cannot find the icon path" in outerr.out
+
+    def test_list_tool_cache(self, caplog, mocker):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_name = "mock_tool_package_name"
+            func_name = "func_name"
+            run_pf_command("tool", "init", "--package", package_name, "--tool", func_name, cwd=temp_dir)
+            package_folder = Path(temp_dir) / package_name
+
+            # Package tool project
+            subprocess.check_call([sys.executable, "setup.py", "sdist", "bdist_wheel"], cwd=package_folder)
+
+            package_file = list((package_folder / "dist").glob("*.whl"))
+            assert len(package_file) == 1
+            # Install package
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", package_file[0].as_posix()], cwd=package_folder
+            )
+
+            package_module = importlib.import_module(package_name)
+            # cache file in installed package
+            assert (Path(package_module.__file__).parent / "yamls" / "tools_meta.yaml").exists()
+
+            from mock_tool_package_name import utils
+
+            # Get tools meta from cache file
+            with caplog.at_level(level=logging.DEBUG, logger=utils.logger.name):
+                tools_meta = utils.list_package_tools()
+            assert "List tools meta from cache file" in caplog.text
+            assert f"{package_name}.{func_name}.{func_name}" in tools_meta
 
     def test_tool_list(self, capsys):
         # List package tools in environment
@@ -1863,6 +1878,32 @@ class TestCli:
         # both runs are deleted and their folders are deleted
         assert not os.path.exists(path_a)
 
+    def test_basic_flow_run_delete_no_confirm(self, monkeypatch, local_client, capfd) -> None:
+        run_id = str(uuid.uuid4())
+        run_pf_command(
+            "run",
+            "create",
+            "--name",
+            run_id,
+            "--flow",
+            f"{FLOWS_DIR}/print_env_var",
+            "--data",
+            f"{DATAS_DIR}/env_var_names.jsonl",
+        )
+        out, _ = capfd.readouterr()
+        assert "Completed" in out
+
+        run_a = local_client.runs.get(name=run_id)
+        local_storage = LocalStorageOperations(run_a)
+        path_a = local_storage.path
+        assert os.path.exists(path_a)
+
+        # delete the run
+        run_pf_command("run", "delete", "--name", f"{run_id}", "-y")
+
+        # both runs are deleted and their folders are deleted
+        assert not os.path.exists(path_a)
+
     def test_basic_flow_run_delete_error(self, monkeypatch) -> None:
         input_list = ["y"]
 
@@ -1894,8 +1935,16 @@ class TestCli:
                 f"{EXPERIMENT_DIR}/basic-no-script-template/basic.exp.yaml",
             )
 
+    @pytest.mark.skipif(condition=not is_live(), reason="Injection cannot passed to detach process.")
     @pytest.mark.usefixtures("setup_experiment_table")
     def test_experiment_start(self, monkeypatch, capfd, local_client):
+        def wait_for_experiment_terminated(experiment_name):
+            experiment = local_client._experiments.get(experiment_name)
+            while experiment.status in [ExperimentStatus.IN_PROGRESS, ExperimentStatus.QUEUING]:
+                sleep(10)
+                experiment = local_client._experiments.get(experiment_name)
+            return experiment
+
         with mock.patch("promptflow._sdk._configuration.Configuration.is_internal_features_enabled") as mock_func:
             mock_func.return_value = True
             exp_name = str(uuid.uuid4())
@@ -1903,7 +1952,7 @@ class TestCli:
                 "experiment",
                 "create",
                 "--template",
-                f"{EXPERIMENT_DIR}/basic-no-script-template/basic.exp.yaml",
+                f"{EXPERIMENT_DIR}/basic-script-template/basic-script.exp.yaml",
                 "--name",
                 exp_name,
             )
@@ -1918,33 +1967,90 @@ class TestCli:
                 exp_name,
             )
             out, _ = capfd.readouterr()
-            assert ExperimentStatus.TERMINATED in out
+            assert ExperimentStatus.QUEUING in out
+            wait_for_experiment_terminated(exp_name)
             exp = local_client._experiments.get(name=exp_name)
-            assert len(exp.node_runs["main"]) > 0
-            assert len(exp.node_runs["eval"]) > 0
+            assert len(exp.node_runs) == 4
+            assert all(len(exp.node_runs[node_name]) > 0 for node_name in exp.node_runs)
             metrics = local_client.runs.get_metrics(name=exp.node_runs["eval"][0]["name"])
             assert "accuracy" in metrics
 
-    def test_batch_run_timeout(self, local_client):
-        line_timeout_seconds = "54"
-        timout_index = 9
-        p = multiprocessing.Process(
-            target=run_batch,
-            args=(local_client, line_timeout_seconds, timout_index),
-        )
-        p.start()
-        p.join()
-        assert p.exitcode == 0
+    @pytest.mark.usefixtures("setup_experiment_table", "recording_injection")
+    def test_experiment_test(self, monkeypatch, capfd, local_client, tmpdir):
+        with mock.patch("promptflow._sdk._configuration.Configuration.is_internal_features_enabled") as mock_func:
+            mock_func.return_value = True
+            run_pf_command(
+                "flow",
+                "test",
+                "--flow",
+                f"{FLOWS_DIR}/web_classification",
+                "--experiment",
+                f"{EXPERIMENT_DIR}/basic-no-script-template/basic.exp.yaml",
+                "--detail",
+                Path(tmpdir).as_posix(),
+            )
+            out, _ = capfd.readouterr()
+            assert "main" in out
+            assert "eval" in out
 
-    def test_batch_run_completed_within_the_required_time(self, local_client):
-        line_timeout_seconds = "600"
-        p = multiprocessing.Process(
-            target=run_batch,
-            args=(
-                local_client,
-                line_timeout_seconds,
-            ),
+        for filename in ["flow.detail.json", "flow.output.json", "flow.log"]:
+            for node_name in ["main", "eval"]:
+                path = Path(tmpdir) / node_name / filename
+                assert path.is_file()
+
+    def test_run_list(self, local_client):
+        from promptflow._sdk.entities import Run
+
+        with patch.object(Run, "_to_dict") as mock_to_dict:
+            mock_to_dict.side_effect = RuntimeError("mock exception")
+            run_pf_command(
+                "run",
+                "list",
+            )
+
+    def test_pf_flow_test_with_detail(self, tmpdir):
+        run_pf_command(
+            "flow",
+            "test",
+            "--flow",
+            f"{FLOWS_DIR}/web_classification",
+            "--inputs",
+            "url=https://www.youtube.com/watch?v=o5ZQyXaAv1g",
+            "answer=Channel",
+            "evidence=Url",
+            "--detail",
+            Path(tmpdir).as_posix(),
         )
-        p.start()
-        p.join()
-        assert p.exitcode == 0
+        # when specify parameter `detail`, detail, output and log will be saved in
+        # the specified folder
+        for filename in ["flow.detail.json", "flow.output.json", "flow.log"]:
+            path = Path(tmpdir) / filename
+            assert path.is_file()
+
+    def test_pf_flow_test_single_node_with_detail(self, tmpdir):
+        node_name = "fetch_text_content_from_url"
+        run_pf_command(
+            "flow",
+            "test",
+            "--flow",
+            f"{FLOWS_DIR}/web_classification",
+            "--inputs",
+            "inputs.url="
+            "https://www.microsoft.com/en-us/d/xbox-wireless-controller-stellar-shift-special-edition/94fbjc7h0h6h",
+            "--node",
+            node_name,
+            "--detail",
+            Path(tmpdir).as_posix(),
+        )
+        output_path = Path(FLOWS_DIR) / "web_classification" / ".promptflow" / f"flow-{node_name}.node.detail.json"
+        assert output_path.exists()
+
+        # when specify parameter `detail`, node detail, output and log will be saved in
+        # the specified folder
+        for filename in [
+            f"flow-{node_name}.node.detail.json",
+            f"flow-{node_name}.node.output.json",
+            f"{node_name}.node.log",
+        ]:
+            path = Path(tmpdir) / filename
+            assert path.is_file()

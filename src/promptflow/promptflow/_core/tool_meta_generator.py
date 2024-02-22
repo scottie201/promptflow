@@ -100,6 +100,18 @@ def collect_tool_functions_in_module(m):
     return tools
 
 
+def collect_flow_entry_in_module(m, entry):
+    entry = entry.split(":")[-1]
+    func = getattr(m, entry, None)
+    if isinstance(func, types.FunctionType):
+        return func
+    raise PythonParsingError(
+        message_format="Failed to collect flow entry '{entry}' in module '{module}'.",
+        entry=entry,
+        module=m.__name__,
+    )
+
+
 def collect_tool_methods_in_module(m):
     tools = []
     for _, obj in inspect.getmembers(m):
@@ -120,7 +132,9 @@ def collect_tool_methods_with_init_inputs_in_module(m):
     return tools
 
 
-def _parse_tool_from_function(f, initialize_inputs=None, gen_custom_type_conn=False, skip_prompt_template=False):
+def _parse_tool_from_function(
+    f, initialize_inputs=None, gen_custom_type_conn=False, skip_prompt_template=False, include_outputs=False
+):
     try:
         tool_type = getattr(f, "__type", None) or ToolType.PYTHON
     except Exception as e:
@@ -132,7 +146,7 @@ def _parse_tool_from_function(f, initialize_inputs=None, gen_custom_type_conn=Fa
     if hasattr(f, "__original_function"):
         f = f.__original_function
     try:
-        inputs, _, _, enable_kwargs = function_to_interface(
+        inputs, outputs, _, enable_kwargs = function_to_interface(
             f,
             initialize_inputs=initialize_inputs,
             gen_custom_type_conn=gen_custom_type_conn,
@@ -153,6 +167,7 @@ def _parse_tool_from_function(f, initialize_inputs=None, gen_custom_type_conn=Fa
         name=tool_name or f.__qualname__,
         description=description or inspect.getdoc(f),
         inputs=inputs,
+        outputs=outputs if include_outputs else None,
         type=tool_type,
         class_name=class_name,
         function=f.__name__,
@@ -256,6 +271,7 @@ def generate_python_meta_dict(name, content, source=None):
     return asdict_without_none(generate_python_tool(name, content, source))
 
 
+# Only used in non-code first experience.
 def generate_python_meta(name, content, source=None):
     return json.dumps(generate_python_meta_dict(name, content, source), indent=2)
 
@@ -269,12 +285,12 @@ def generate_tool_meta_dict_by_file(path: str, tool_type: ToolType):
     note that if a python file is passed, correct working directory must be set and should be added to sys.path.
     """
     tool_type = ToolType(tool_type)
-    file = Path(path).resolve()
+    file = Path(path)
     if not file.is_file():
         raise MetaFileNotFound(
             message_format="Generate tool meta failed for {tool_type} tool. Meta file '{file_path}' can not be found.",
             tool_type=tool_type.value,
-            file_path=str(file),
+            file_path=path,  # Use a relative path here to make the error message more readable.
         )
     try:
         content = file.read_text(encoding="utf-8")
@@ -286,7 +302,7 @@ def generate_tool_meta_dict_by_file(path: str, tool_type: ToolType):
                 "Read meta file '{file_path}' failed: {error_type_and_message}"
             ),
             tool_type=tool_type.value,
-            file_path=str(file),
+            file_path=path,
             error_type_and_message=error_type_and_message,
         ) from e
 
@@ -307,6 +323,29 @@ def generate_tool_meta_dict_by_file(path: str, tool_type: ToolType):
             tool_type=tool_type.value,
             supported_tool_types=",".join([ToolType.PYTHON, ToolType.LLM, ToolType.PROMPT]),
         )
+
+
+def generate_flow_meta_dict_by_file(path: str, entry: str, source: str = None):
+    m = load_python_module_from_file(Path(path))
+    f = collect_flow_entry_in_module(m, entry)
+    # Since the flow meta is generated from the entry function, we leverage the function
+    # _parse_tool_from_function to parse the interface of the entry function to get the inputs and outputs.
+    tool = _parse_tool_from_function(f, include_outputs=True)
+
+    flow_meta = {"entry": entry, "function": f.__name__}
+    if source:
+        flow_meta["source"] = source
+    if tool.inputs:
+        flow_meta["inputs"] = {}
+        for k, v in tool.inputs.items():
+            # We didn't support specifying multiple types for inputs, so we only take the first one.
+            flow_meta["inputs"][k] = {"type": v.type[0].value}
+    if tool.outputs:
+        flow_meta["outputs"] = {}
+        for k, v in tool.outputs.items():
+            # We didn't support specifying multiple types for outputs, so we only take the first one.
+            flow_meta["outputs"][k] = {"type": v.type[0].value}
+    return flow_meta
 
 
 class ToolValidationError(UserErrorException):

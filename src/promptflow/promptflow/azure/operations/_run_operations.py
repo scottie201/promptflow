@@ -53,7 +53,7 @@ from promptflow._utils.logger_utils import get_cli_sdk_logger
 from promptflow.azure._constants._flow import AUTOMATIC_RUNTIME, AUTOMATIC_RUNTIME_NAME, CLOUD_RUNS_PAGE_SIZE
 from promptflow.azure._load_functions import load_flow
 from promptflow.azure._restclient.flow_service_caller import FlowServiceCaller
-from promptflow.azure._utils.gerneral import get_user_alias_from_credential, get_authorization
+from promptflow.azure._utils.gerneral import get_authorization, get_user_alias_from_credential
 from promptflow.azure.operations._flow_operations import FlowOperations
 from promptflow.exceptions import UserErrorException
 
@@ -73,8 +73,7 @@ class RunOperations(WorkspaceTelemetryMixin, _ScopeDependentOperations):
     """RunOperations that can manage runs.
 
     You should not instantiate this class directly. Instead, you should
-    create an :class:`~promptflow.azure.PFClient` instance that instantiates it for you and
-    attaches it as an attribute.
+    create an :class:`~promptflow.azure.PFClient` instance and this operation is available as the instance's attribute.
     """
 
     def __init__(
@@ -585,11 +584,14 @@ class RunOperations(WorkspaceTelemetryMixin, _ScopeDependentOperations):
         return self._modify_run_in_run_history(run_id=run, payload=payload)
 
     @monitor_operation(activity_name="pfazure.runs.stream", activity_type=ActivityType.PUBLICAPI)
-    def stream(self, run: Union[str, Run], raise_on_error: bool = True) -> Run:
+    def stream(self, run: Union[str, Run], raise_on_error: bool = True, timeout: int = 600, **kwargs) -> Run:
         """Stream the logs of a run.
 
         :param run: The run name or run object
         :type run: Union[str, ~promptflow.entities.Run]
+        :param timeout: If the run stays in the same status and produce no new logs in a period
+             longer than the timeout value, the stream operation will abort. Default timeout value is 600 seconds.
+        :type timeout: int
         :param raise_on_error: Raises an exception if a run fails or canceled.
         :type raise_on_error: bool
         :return: The run object
@@ -603,7 +605,10 @@ class RunOperations(WorkspaceTelemetryMixin, _ScopeDependentOperations):
         try:
             printed = 0
             stream_count = 0
-            start = time.time()
+            prev_active_time = time.time()
+            prev_active_log = ""
+            prev_active_status = run.status
+
             while run.status in RUNNING_STATUSES or run.status == RunStatus.FINALIZING:
                 file_handler.flush()
                 stream_count += 1
@@ -612,18 +617,24 @@ class RunOperations(WorkspaceTelemetryMixin, _ScopeDependentOperations):
                     # print prompt every 3 times
                     file_handler.write(f"(Run status is {run.status!r}, continue streaming...)\n")
 
-                # if the run is not started for 5 minutes, print an error message and break the loop
-                if run.status == RunStatus.NOT_STARTED:
-                    current = time.time()
-                    if current - start > 300:
-                        file_handler.write(
-                            f"The run {run.name!r} is in status 'NotStarted' for 5 minutes, streaming is stopped."
-                            "Please make sure you are using the latest runtime.\n"
-                        )
-                        break
-
                 available_logs = self._get_log(flow_run_id=run.name)
                 printed = incremental_print(available_logs, printed, file_handler)
+
+                # if the run status is not changed, and the log is not changed, and it lasts for timeout seconds,
+                # we assume the run is stuck, and we should stop the streaming.
+                if available_logs != prev_active_log or run.status != prev_active_status:
+                    prev_active_log = available_logs
+                    prev_active_status = run.status
+                    prev_active_time = time.time()
+                elif time.time() - prev_active_time > timeout:
+                    file_handler.write(
+                        f"The run {run.name!r} is in status {run.status} and produce no new logs for {timeout} seconds,"
+                        "streaming is stopped. If the final status is 'NotStarted', "
+                        "Please make sure you are using the latest runtime.\n"
+                        "For automatic runtime case, please try extending the timeout value.\n"
+                    )
+                    break
+
                 time.sleep(10)
                 run = self.get(run=run.name)
             # ensure all logs are printed
@@ -800,9 +811,9 @@ class RunOperations(WorkspaceTelemetryMixin, _ScopeDependentOperations):
 
     def _resolve_runtime(self, run, flow_path, runtime):
         runtime = run._runtime or runtime
-        # for remote flow case, use flow name as session id
+        # for remote flow case, leave session id to None and let service side resolve
         # for local flow case, use flow path to calculate session id
-        session_id = run._flow_name if run._use_remote_flow else self._get_session_id(flow=flow_path)
+        session_id = None if run._use_remote_flow else self._get_session_id(flow=flow_path)
 
         if runtime is None or runtime == AUTOMATIC_RUNTIME_NAME:
             runtime = self._resolve_automatic_runtime()
@@ -874,6 +885,12 @@ class RunOperations(WorkspaceTelemetryMixin, _ScopeDependentOperations):
         self, run: Union[str, Run], output: Optional[Union[str, Path]] = None, overwrite: Optional[bool] = False
     ) -> str:
         """Download the data of a run, including input, output, snapshot and other run information.
+
+        .. note::
+
+            After the download is finished, you can use ``pf run create --source <run-info-local-folder>``
+            to register this run as a local run record, then you can use commands like ``pf run show/visualize``
+            to inspect the run just like a run that was created from local flow.
 
         :param run: The run name or run object
         :type run: Union[str, ~promptflow.entities.Run]
