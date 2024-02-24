@@ -1,0 +1,10 @@
+tests:
+  - name: chat-basic_default_20240224_104054_905000
+    display_name: chat-basic_${variant_id}_${timestamp}
+    flow: /home/complete_excavation/NEW
+      PROJECT/promptflow/examples/flows/chat/chat-basic
+    data: /home/complete_excavation/NEW
+      PROJECT/promptflow/examples/flows/chat/chat-basic/data.jsonl
+    column_mapping:
+      chat_history: <Please select a data input>
+      question: <Please select a data input>
