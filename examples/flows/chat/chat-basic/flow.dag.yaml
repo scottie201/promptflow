@@ -9,12 +9,11 @@ inputs:
     type: string
     is_chat_input: true
     default: What is ChatGPT?
-  json_files:
+  customer_ledger_content:
+    type: object
+  "":
     type: string
-    default: Financial summaries are available.
-  TEST:
-    type: string
-    default: "this is just a test"
+    default: ""
 outputs:
   answer:
     type: string
